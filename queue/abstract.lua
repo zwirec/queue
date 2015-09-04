@@ -359,11 +359,9 @@ function method.start()
 end
 
 local human_states = {}
-human_states[state.READY]      = 'ready'
-human_states[state.DELAYED]    = 'delayed'
-human_states[state.TAKEN]      = 'taken'
-human_states[state.BURIED]     = 'buried'
-human_states[state.DONE]       = 'done'
+for name, state in pairs(state) do
+    human_states[state] = name:lower()
+end
 
 local idx_tube = 1
 

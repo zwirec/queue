@@ -5,4 +5,5 @@ return {
     DONE    = '-',
     BURIED  = '!',
     DELAYED = '~',
+    BLOCKED = 'b'
 }

@@ -6,7 +6,7 @@ local json = require 'json'
 local fiber = require 'fiber'
 
 local TIMEOUT_INFINITY  = 365 * 86400 * 500
-
+local LIMIT_DEFAULT     = 1
 
 local i_id              = 1
 local i_status          = 2
@@ -73,6 +73,17 @@ function tube.new(space, on_task_change, opts)
     if on_task_change == nil then
         on_task_change = function() end
     end
+    if opts.limit == nil then
+        opts.limit = {}
+    elseif type(opts.limit) == 'table' then
+        for utube, limit in pairs(opts.limit) do
+            if limit < 1 then
+                error(string.format("Invalid limit %s for %s", limit, utube))
+            end
+        end
+    else
+        error('invalid opts.limit, expected table[utube] = limit')
+    end
     local self = {
         space           = space,
         on_task_change  = function(self, task, stat_data)
@@ -95,25 +106,39 @@ function tube.new(space, on_task_change, opts)
     return self
 end
 
-
-local function process_neighbour(self, task, operation)
-    self:on_task_change(task, operation)
-    if task ~= nil then
-        local neighbour = self.space.index.utube:min{state.READY, task[i_utube]}
-        if neighbour ~= nil and neighbour[i_status] == state.READY then
-            self:on_task_change(neighbour)
-        end
+-- Upgrade one BLOCKED task to READY status
+local function unblock_one(self, utube)
+    local neighbour = self.space.index.utube:min{state.BLOCKED, utube}
+    if neighbour == nil or neighbour[i_utube] ~= utube or
+        neighbour[i_status] ~= state.BLOCKED then
+            return
     end
-    return task
+    neighbour = self.space:update(neighbour[i_id],
+        { { '=', i_status, state.READY } })
+    self:on_task_change(neighbour)
 end
 
+-- Check if a new task should be in READY or BLOCKED state
+local function check_limit(self, utube)
+    -- space contains at most one TAKEN or READY tuple
+    local limit = self.opts.limit[utube] or LIMIT_DEFAULT
+    assert(limit >= 1)
+    local cnt = self.space.index.utube:count({state.TAKEN, utube})
+    if cnt < limit then
+        cnt = cnt + self.space.index.utube:count({state.READY, utube})
+    end
+    if cnt < limit then
+        return state.READY
+    end
+    return state.BLOCKED
+end
 
 -- watch fiber
 function method._fiber(self)
-    fiber.name('fifottl')
+    fiber.name('utubettl')
     log.info("Started queue utubettl fiber")
     local estimated
-    local ttl_statuses = { state.READY, state.BURIED }
+    local ttl_statuses = { state.READY, state.BLOCKED, state.BURIED }
     local now, task
 
     while true do
@@ -125,7 +150,7 @@ function method._fiber(self)
         if task and task[i_status] == state.DELAYED then
             if now >= task[i_next_event] then
                 task = self.space:update(task[i_id], {
-                    { '=', i_status, state.READY },
+                    { '=', i_status, check_limit(self, task[i_utube]) },
                     { '=', i_next_event, task[i_created] + task[i_ttl] }
                 })
                 self:on_task_change(task)
@@ -141,7 +166,8 @@ function method._fiber(self)
             if task ~= nil and task[i_status] == state then
                 if now >= task[i_next_event] then
                     self.space:delete(task[i_id])
-                    self:on_task_change(task:transform(2, 1, state.DONE))
+                    task = task:update{{'=', i_status, state.DONE}}
+                    self:on_task_change(task)
                     estimated = 0
                 else
                     local et = tonumber(task[i_next_event] - now) / 1000000
@@ -156,6 +182,7 @@ function method._fiber(self)
         task = self.space.index.watch:min{ state.TAKEN }
         if task and task[i_status] == state.TAKEN then
             if now >= task[i_next_event] then
+                -- READY <-> TAKEN doesn't affect utube limit invariant
                 task = self.space:update(task[i_id], {
                     { '=', i_status, state.READY },
                     { '=', i_next_event, task[i_created] + task[i_ttl] }
@@ -199,6 +226,7 @@ function method.put(self, data, opts)
     local ttl = opts.ttl or self.opts.ttl
     local ttr = opts.ttr or self.opts.ttr
     local pri = opts.pri or self.opts.pri or 0
+    local utube = opts.utube and tostring(opts.utube) or ""
 
     local next_event
 
@@ -207,7 +235,7 @@ function method.put(self, data, opts)
         ttl = ttl + opts.delay
         next_event = event_time(opts.delay)
     else
-        status = state.READY
+        status = check_limit(self, utube)
         next_event = event_time(ttl)
     end
 
@@ -219,7 +247,7 @@ function method.put(self, data, opts)
             time(ttr),
             pri,
             time(),
-            tostring(opts.utube),
+            utube,
             data
     }
     self:on_task_change(task, 'put')
@@ -229,20 +257,16 @@ end
 
 -- take task
 function method.take(self)
-    for s, t in self.space.index.status:pairs(state.READY, {iterator = 'GE'}) do
-        if t[2] ~= state.READY then
-            break
-        end
-        local next_event = time() + t[i_ttr]
-        local taken = self.space.index.utube:min{state.TAKEN, t[i_utube]}
-        if taken == nil or taken[i_status] ~= state.TAKEN then
-            t = self.space:update(t[1], { 
-                { '=', i_status, state.TAKEN },
-                { '=', i_next_event, next_event }
-            })
-            self:on_task_change(t, 'take')
-            return t
-        end
+    -- READY <-> TAKEN doesn't affect utube limit invariant
+    local task = self.space.index.status:min{state.READY}
+    if task ~= nil and task[i_status] == state.READY then
+        local next_event = time() + task[i_ttr]
+        task = self.space:update(task[1], {
+            { '=', i_status, state.TAKEN },
+            { '=', i_next_event, next_event },
+        })
+        self:on_task_change(task, 'take')
+        return task
     end
 end
 
@@ -250,11 +274,16 @@ end
 -- delete task
 function method.delete(self, id)
     local task = self.space:delete(id)
-    if task ~= nil then
-        task = task:transform(i_status, 1, state.DONE)
-        return process_neighbour(self, task, 'delete')
+    if task == nil then
+        return
     end
-    self:on_task_change(task, 'delete')
+    local new_task = task:update({ {'=', i_status, state.DONE} })
+    self:on_task_change(new_task, 'delete')
+    -- utube limit: unblock the next task if status was READY or TAKEN
+    if task[i_status] == state.READY or task[i_status] == state.TAKEN then
+        unblock_one(self, task[i_utube])
+    end
+    return new_task
 end
 
 -- release task
@@ -263,48 +292,52 @@ function method.release(self, id, opts)
     if task == nil then
         return
     end
+    local new_task
     if opts.delay ~= nil and opts.delay > 0 then
-        task = self.space:update(id, {
+        new_task = self.space:update(id, {
             { '=', i_status, state.DELAYED },
             { '=', i_next_event, event_time(opts.delay) },
             { '+', i_ttl, opts.delay }
         })
-        if task ~= nil then
-            return process_neighbour(self, task, 'release')
-        end
     else
-        task = self.space:update(id, {
-            { '=', i_status, state.READY },
+        new_task = self.space:update(id, {
+            { '=', i_status, state.BLOCKED },
             { '=', i_next_event, task[i_created] + task[i_ttl] }
         })
     end
-    self:on_task_change(task, 'release')
-    return task
+    self:on_task_change(new_task, 'release')
+    -- utube limit: unblock the next task if status was READY or TAKEN
+    if task[i_status] == state.READY or task[i_status] == state.TAKEN then
+        unblock_one(self, task[i_utube])
+    end
+    return new_task
 end
 
 -- bury task
 function method.bury(self, id)
-    local task = self.space:update(id, {{ '=', i_status, state.BURIED }})
-    if task ~= nil then
-        return process_neighbour(
-            self, task:transform(i_status, 1, state.BURIED), 'bury'
-        )
+    local task = self.space:get{id}
+    if task == nil then
+        return
     end
-    self:on_task_change(task, 'bury')
+    local new_task = self.space:update(id, {{ '=', i_status, state.BURIED }})
+    self:on_task_change(new_task, 'bury')
+    -- utube limit: unblock the next task if status was READY or TAKEN
+    if task[i_status] == state.READY or task[i_status] == state.TAKEN then
+        unblock_one(self, task[i_utube])
+    end
+    return new_task
 end
 
 -- unbury several tasks
 function method.kick(self, count)
     for i = 1, count do
         local task = self.space.index.status:min{ state.BURIED }
-        if task == nil then
-            return i - 1
-        end
-        if task[i_status] ~= state.BURIED then
+        if task == nil or task[i_status] ~= state.BURIED then
             return i - 1
         end
 
-        task = self.space:update(task[i_id], {{ '=', i_status, state.READY }})
+        task = self.space:update(task[i_id], {{ '=', i_status,
+            check_limit(self, task[i_utube]) }})
         self:on_task_change(task, 'kick')
     end
     return count

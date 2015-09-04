@@ -62,6 +62,8 @@ in strict FIFO order.
 ## `utubettl` - extention of `utube` to support `ttl`
 
 This tube works the same way as 'fifottl' and 'utube' queues.
+`utubettl` supports per utube limit for the number of taken tasks:
+`limit = { utube1 = number, utube2 = number }`.
 
 # The supporting schema
 
@@ -181,7 +183,6 @@ The full list of options is (simpler queues may not support some of them):
 * `pri` - task priority, **lowest** is the **highest**
 * `delay` - task execution must be delayed for the given number of seconds.
   Delay time is added to the total time to live of the task.
-
 This method returns the created task.
 
 ## Consumer API

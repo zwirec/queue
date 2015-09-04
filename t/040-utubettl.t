@@ -6,7 +6,7 @@ local test = (require 'tap').test()
 local tnt  = require 't.tnt'
 local state = require 'queue.abstract.state'
 local yaml = require 'yaml'
-test:plan(14)
+test:plan(15)
 
 test:ok(rawget(box, 'space'), 'box started')
 
@@ -21,7 +21,7 @@ test:is(tube.name, 'test', 'tube.name')
 test:is(tube.type, 'utubettl', 'tube.type')
 
 test:test('Utubettl statistics', function(test)
-   test:plan(13)
+   test:plan(14)
    tube2:put('stat_0')
    tube2:put('stat_1')
    tube2:put('stat_2')
@@ -43,7 +43,8 @@ test:test('Utubettl statistics', function(test)
    -- check tasks statistics
    test:is(stats.tasks.taken, 1, 'tasks.taken')
    test:is(stats.tasks.buried, 1, 'tasks.buried')
-   test:is(stats.tasks.ready, 1, 'tasks.ready')
+   test:is(stats.tasks.ready, 0, 'tasks.ready')
+   test:is(stats.tasks.blocked, 1, 'tasks.blocked')
    test:is(stats.tasks.done, 2, 'tasks.done')
    test:is(stats.tasks.delayed, 1, 'tasks.delayed')
    test:is(stats.tasks.total, 4, 'tasks.total')
@@ -199,6 +200,33 @@ test:test('release[delay] in utube', function(test)
     test:is(state, 2, 'state was changed')
 end)
 
+test:test('utube limit', function(test)
+    local tube = queue.create_tube('utube_limit', 'utubettl',
+        { limit = { double = 2 } })
+    test:plan(12)
+
+    test:ok(tube:put('ok 1', {utube = 'double'}), 'task was put (utube = double)')
+    test:ok(tube:put('ok 2', {utube = 'double'}), 'task was put (utube = double)')
+    test:ok(tube:put('blocked 1', { utube = 'double'}), 'task was put (utube = double)')
+    test:ok(tube:put('blocked 2', { utube = 'double'}), 'task was put (utube = double)')
+    test:is(tube:take()[3], 'ok 1', 'task was taken (utube = double)')
+    test:is(tube:take()[3], 'ok 2', 'task was taken (utube = double)')
+    test:is(tube:peek(2)[2], state.BLOCKED, 'task was blocked (utube = double)')
+    test:is(tube:peek(3)[2], state.BLOCKED, 'task was blocked (utube = double)')
+
+    test:ok(tube:put('ok single', {utube = 'single'}), 'task was put (utube = single)')
+    test:is(tube:take()[3], 'ok single', 'task was taken (utube = single)')
+    tube:ack(4)
+
+    tube:ack(0)
+    test:is(tube:take()[3], 'blocked 1', 'task was taken (utube = double)')
+    tube:ack(1)
+    test:is(tube:take()[3], 'blocked 2', 'task was taken (utube = double)')
+    tube:ack(2)
+    tube:ack(3)
+
+    tube:drop()
+end)
 
 tnt.finish()
 test:check()
