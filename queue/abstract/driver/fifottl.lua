@@ -262,16 +262,18 @@ end
 function method.take(self)
     local offset = 0
     local task = nil
-    while true do
-        task = self.space.index.status:select({state.READY},
-                {offset=offset, limit=1, iterator='GE'})[1]
-        if task == nil or task[i_status] ~= state.READY then
+    for _, t in self.space.index.status:pairs({state.READY}, {iterator = 'GE'}) do
+        if t[i_status] ~= state.READY then
             return
-        elseif is_expired(task) then
-            offset = offset + 1
-        else
-            break;
         end
+        if not is_expired(t) then
+            task = t
+            break
+        end
+    end
+
+    if task == nil then
+        return
     end
 
     local next_event = time() + task[i_ttr]
